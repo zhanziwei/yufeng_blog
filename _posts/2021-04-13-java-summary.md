@@ -1,6 +1,6 @@
 ---
 layout: post
-title: Java编程思想的一些
+title: Java编程思想的一些总结
 date: 2021-04-14
 Author: yufeng 
 tags: [Java]
