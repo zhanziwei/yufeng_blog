@@ -44,8 +44,40 @@ toc: true
 | double   | 64 bits | IEEE754   | IEEE754        | Double    |
 | void     | —       | —         | —              | Void      |
 
+若希望在堆内存里表示基本类型的数据，则用到它们的包装类，会进行自动装箱和自动拆箱
+
 ### BigInteger和BigDecimal
 
 BigInteger支持任意精度的整数，可用于精确表示任意大小的整数值。BigDecimal支持任意精度的定点数字。
-### test
+### JVM的垃圾回收
+
+引用s在作用域终点结束，但指向的字符串对象依然存在于内存中，Java的垃圾收集器检查所有new出来的对象并判断不可达，来释放那些被占用的内存。
+
+#### 反向URL的作用
+
+所有文件都存在于自己的命名空间中，文件中的每个类都具有唯一标识符。
+
+#### static关键字
+
+1. 修饰静态变量：多个对象共享相同的变量
+2. 修饰静态方法：类名.方法名访问方法
+3. 修饰静态代码块：类初次加载时候进行初始化
+
+#### 测试对象等价
+
+System.out.println(n1==n2)和System.out.println(n1 != n2);，对于两个Integer对象相等，所以先输出true，后输出false。因为Integer内部维护着一个IntegerCache的缓存，[-128,127]之间的值用==和！=比较也能得到正确结果。
+
+#### 字面值常量
+
+```java
+int i1 = ox2f;
+int i3 = 0177;
+char c = 0xffff;
+byte b = 0x7f;
+short s = 0x7fff;
+long n1 = 200L;
+byte blb = (byte)0b00110101;
+float f2 = 1f;
+double d1 = 1d;
+```
 
