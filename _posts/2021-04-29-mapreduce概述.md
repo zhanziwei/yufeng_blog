@@ -388,21 +388,31 @@ input.getSplits(job)
 
 ##### Map端
 
-1. 由程序内的InputFormat（默认实现类为TextInputFormat）来读取外部数据，它调用RecordReader（它的成员变量）的read方法来读取，返回k,v键值对
-2. 读取的k，v键值对传送给map方法，作为其入参来执行用户定义的map逻辑。
-3. context.write方法被调用时，outputCollector.collect方法将map方法的输出结果写入到环形缓冲区中。
-4. 环形缓冲区就是一个数组，后端不断接受数据的同时，前端数据不断被溢出，长度用完后读取的新数据再从前端开始覆盖。默认大小为100M，通过MR.SORT.MB配置，当缓冲的容量达到默认大小的80%时，进行反向溢写。
-5. spiller组件会从环形缓冲区溢出文件，这过程会按照partitioner分区（默认hashpartition），并且按照key.compareTo进行排序（底层使用快排和外部排序），若有combiner也会执行combiner，spiller的工作会溢出许多小文件
-6. 小文件执行merge，形成分区且区内有序的大文件（归并排序，会再一次调用combiner）。
-7. Reduce会根据分区，去所有map task中，从文件读取对应的数据。
+1. **Read阶段**：由程序内的InputFormat（默认实现类为TextInputFormat）来读取外部数据，它调用RecordReader（它的成员变量）的read方法来读取，返回k,v键值对
+
+2. **Map阶段**：读取的k，v键值对传送给map方法，作为其入参来执行用户定义的map逻辑。
+
+3. **Collect阶段**：context.write方法被调用时，outputCollector.collect方法将map方法的输出结果写入到环形缓冲区中。
+
+4. **Spill阶段**：环形缓冲区就是一个数组，后端不断接受数据的同时，前端数据不断被溢出，长度用完后读取的新数据再从前端开始覆盖。默认大小为100M，通过MR.SORT.MB配置，当缓冲的容量达到默认大小的80%时，进行反向溢写。
+
+   Spill详情：
+
+   * 默认使用快排队缓冲区内的数据排序，先按照分区编号Partition，再按照key进行排序，形成分区并分区内所有数据按key有序
+   * 按照分区编号由小到大依次将每个分区中的数据写入任务工作目录下的临时文件，如果用户设置了Combiner，则写入文件之前，对每个分区中的数据进行聚集
+   * 将分区数据的元信息写到内存索引数据结构SpillRecord中，每个分区的元信息包括在临时文件中的偏移量、压缩前数据大小和压缩后数据大小。
+   * Combine阶段：临时文件执行merge，以分区为单位进行合并，会再一次调用Combiner，合并成一个大文件
+
+每个MapTask最终只生成一个数据文件，避免同时打开大量文件和同时读取大量小文件产生的IO开销。
 
 ##### Reduce端
 
 ![img](https://pic2.zhimg.com/80/v2-b26eeb521fd5e03f5c835c7c237bbef1_720w.jpg)
 
-1. Reduce task通过网络向map task获取某一分区的数据
-2. 通过GroupingComparator()分辨同一组数据，把它们发送给reduce(k, iterator)方法
-3. 调用context.write()方法，让OutputFormat调用RecordWriter的write()方法将处理结果写入到数据仓库中，写出的只有一个分区的文件数据。
+1. **Copy阶段**：Reduce task从各个MapTask上远程拷贝一片数据，如果大小超过阈值，则写到磁盘，否则放到内存
+2. **Merge阶段**：远程拷贝数据的同时，ReduceTask启动两个后台线程对内存和磁盘上的文件进行合并，防止内存使用过多或磁盘上文件过多
+3. **Sort阶段**：通过GroupingComparator()分辨同一组数据，把它们发送给reduce(k, iterator)方法
+4. **Reduce阶段**：调用context.write()方法，让OutputFormat调用RecordWriter的write()方法将处理结果写入到数据仓库中，写出的只有一个分区的文件数据。
 
 #### Shuffle机制
 
