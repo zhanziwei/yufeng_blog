@@ -380,6 +380,8 @@ input.getSplits(job)
 
    顺序文件格式，存储二进制的键值对的序列，键和值由顺序文件决定，要保证map输入的类型匹配。
 
+   SequenceFile文件包括文件头、文件记录、同步标识。
+
 #### MapReduce的计算过程
 
 ![preview](https://pic2.zhimg.com/v2-bd1d4a527fba9a9d265cd05e990ed455_r.jpg)
@@ -412,6 +414,20 @@ input.getSplits(job)
 
 1. 每个map可能会有多个spill文件需要写入磁盘，产生较多的磁盘IO
 2. 数据量很小，但map和reduce任务很多时，产生较多的网络IO
+
+### Combiner函数何时被使用
+
+1. Map端溢出spill文件后，进行分区排序后，会执行combiner函数
+2. 多个spill文件合并成一个大文件时，会使用
+3. 在Reduce任务端，复制map输出，在合并后溢出到磁盘时也会执行combiner函数
+
+#### 为什么要使用combiner
+
+减少本地磁盘io；减少reduce端复制数据的网络io；将上述优化与业务逻辑剥离，使得作业调优与业务逻辑之间的耦合度降低
+
+#### 什么时候用Combiner
+
+对于求最值或者求和之类的统计可以设置Combiner，只要不影响最终的reduce结果。
 
 #### Partition分区
 
@@ -472,7 +488,281 @@ job.setNumReduceTasks(5);
    2. map输出后，按照组合键进行分区和排序，自定义分区函数和排序函数
    3. 针对组合键进行分区和分组时只考虑自然键
 
-4. 二次排序
+   ```java
+   // IntPair为组合键
+   public class FirstPartitioner extends Partitioner<IntPair,IntWritable> {
+       @Override
+       public int getPartition(IntPair key, IntWritable value, int numPartitions) {
+           return Math.abs(key.getFirst() * 127) % numPartitions;
+       }
+   }
+   // 根据key.first进行分区，泛型类型与mapper输出一致
+   
+   public class KeyComparator extends WritableComparator {
+       protected KeyComparator() {
+           super(IntPair.class,true);//需要实例化
+       }
+   
+       @Override
+       public int compare(WritableComparable a, WritableComparable b) {
+           IntPair p1=(IntPair)a;
+           IntPair p2=(IntPair)b;
+           int result = IntPair.compare(p1.getFirst(),p2.getFirst());
+           if(result==0){
+               result = -IntPair.compare(p1.getSecond(),p2.getSecond()); //前面加一个减号求反
+           }
+           return result;
+       }
+   }
+   // key比较器，用来map阶段的key排序使用,根据first升序，second降序排序
+   
+   public class GroupComparator extends WritableComparator {
+       public GroupComparator() {
+           super(IntPair.class,true);
+       }
+   
+   
+       @Override
+       public int compare(WritableComparable a, WritableComparable b) {
+           IntPair p1=(IntPair)a;
+           IntPair p2=(IntPair)b;
+           return IntPair.compare(p1.getFirst(),p2.getFirst());
+       }
+   }
+   // 分组比较器，确保同一个年份的数据在同一个组里，只按年份进行比较
+   ```
 
-   在自定义排序中，如果compareTo中的判断条件为两个即为二次排序
+   分区是将有关联的键划分给同一个reducer处理，多一个分区，则多一个Reducer
 
+   分组是把相同的键的记录整理为一组记录，在同一个分区里面，具有相同key值得记录是属于同一个分组。
+
+#### 连接
+
+##### Map端连接
+
+1. 使用场景：适用于一张表小，一张表很大的场景
+
+2. 优点：在Reduce端处理过多的表，容易产生数据倾斜，通过在Map端缓存多张数据表，提交处理业务逻辑，增加Map端业务，较少Reduce端数据的压力，减少数据倾斜的可能。
+
+3. 具体方法：采用DistributedCache
+
+   * 在Mapper的setup阶段，将文件读取到缓存集合中
+
+     ```java
+     public class DistributedCacheMapper extends Mapper<LongWritable, Text, Text, NullWritable>{
+     
+     	Map<String, String> pdMap = new HashMap<>();
+     	
+     	@Override
+     	protected void setup(Mapper<LongWritable, Text, Text, NullWritable>.Context context) throws IOException, InterruptedException {
+     
+     		// 1 获取缓存的文件
+     		URI[] cacheFiles = context.getCacheFiles();
+     		String path = cacheFiles[0].getPath().toString();
+     		
+     		BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(path), "UTF-8"));
+     		
+     		String line;
+     		while(StringUtils.isNotEmpty(line = reader.readLine())){
+     
+     			// 2 切割
+     			String[] fields = line.split("\t");
+     			
+     			// 3 缓存数据到集合
+     			pdMap.put(fields[0], fields[1]);
+     		}
+     		
+     		// 4 关流
+     		reader.close();
+     	}
+     	
+     	Text k = new Text();
+     	
+     	@Override
+     	protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+     
+     		// 1 获取一行
+     		String line = value.toString();
+     		
+     		// 2 截取
+     		String[] fields = line.split("\t");
+     		
+     		// 3 获取产品id
+     		String pId = fields[1];
+     		
+     		// 4 获取商品名称
+     		String pdName = pdMap.get(pId);
+     		
+     		// 5 拼接
+     		k.set(line + "\t"+ pdName);
+     		
+     		// 6 写出
+     		context.write(k, NullWritable.get());
+     	}
+     }
+     ```
+
+     
+
+   * 在驱动函数中加载缓存，缓存普通文件到Task运行节点
+
+     ```java
+     job.addCacheFile(new URI("file:///e:/小表文件"))
+     
+     job.setNumReduceTasks(0)  // Map端join的逻辑不需要Reduce阶段，设置reduceTask数量为0
+     ```
+
+##### reduce端连接
+
+通过将关联条件作为Map输出的key，将两表满足Join条件的数据并携带数据所在源的文件信息，发往同一个ReduceTask，在Reduce中进行数据的串联
+
+```java
+// 1. 创建商品和订单合并后的Bean类
+public class TableBean implements Writable {
+    private String order_id;
+    private String p_id;
+    private int amount;
+    private String pname;
+    private String flag;
+    
+    @Override
+	public void write(DataOutput out) throws IOException {
+		out.writeUTF(order_id);
+		out.writeUTF(p_id);
+		out.writeInt(amount);
+		out.writeUTF(pname);
+		out.writeUTF(flag);
+	}
+
+	@Override
+	public void readFields(DataInput in) throws IOException {
+		this.order_id = in.readUTF();
+		this.p_id = in.readUTF();
+		this.amount = in.readInt();
+		this.pname = in.readUTF();
+		this.flag = in.readUTF();
+	}
+	... getter and setter
+}
+
+// 2. 编写mapper类
+public class TableMapper extends Mapper<LongWritable, Text, Text, TableBean> {
+    String name;
+    TableBean bean = new TableBean();
+    Text k = new Text();
+    
+    @Override
+	protected void setup(Context context) throws IOException, InterruptedException {
+
+		// 1 获取输入文件切片
+		FileSplit split = (FileSplit) context.getInputSplit();
+
+		// 2 获取输入文件名称
+		name = split.getPath().getName();
+	}
+	@Override
+	protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+		
+		// 1 获取输入数据
+		String line = value.toString();
+		
+		// 2 不同文件分别处理
+		if (name.startsWith("order")) {// 订单表处理
+
+			// 2.1 切割
+			String[] fields = line.split("\t");
+			
+			// 2.2 封装bean对象
+			bean.setOrder_id(fields[0]);
+			bean.setP_id(fields[1]);
+			bean.setAmount(Integer.parseInt(fields[2]));
+			bean.setPname("");
+			bean.setFlag("order");
+			
+			k.set(fields[1]);
+		}else {// 产品表处理
+
+			// 2.3 切割
+			String[] fields = line.split("\t");
+			
+			// 2.4 封装bean对象
+			bean.setP_id(fields[0]);
+			bean.setPname(fields[1]);
+			bean.setFlag("pd");
+			bean.setAmount(0);
+			bean.setOrder_id("");
+			
+			k.set(fields[0]);
+		}
+
+		// 3 写出
+		context.write(k, bean);
+	}
+}
+
+// 3. 编写TableReducer类
+public class TableReducer extends Reducer<Text, TableBean, TableBean, NullWritable> {
+
+	@Override
+	protected void reduce(Text key, Iterable<TableBean> values, Context context)	throws IOException, InterruptedException {
+
+		// 1准备存储订单的集合
+		ArrayList<TableBean> orderBeans = new ArrayList<>();
+		
+// 2 准备bean对象
+		TableBean pdBean = new TableBean();
+
+		for (TableBean bean : values) {
+
+			if ("order".equals(bean.getFlag())) {// 订单表
+
+				// 拷贝传递过来的每条订单数据到集合中
+				TableBean orderBean = new TableBean();
+
+				try {
+					BeanUtils.copyProperties(orderBean, bean);
+				} catch (Exception e) {
+					e.printStackTrace();
+				}
+
+				orderBeans.add(orderBean);
+			} else {// 产品表
+
+				try {
+					// 拷贝传递过来的产品表到内存中
+					BeanUtils.copyProperties(pdBean, bean);
+				} catch (Exception e) {
+					e.printStackTrace();
+				}
+			}
+		}
+
+		// 3 表的拼接
+		for(TableBean bean:orderBeans){
+
+			bean.setPname (pdBean.getPname());
+			
+			// 4 数据写出去
+			context.write(bean, NullWritable.get());
+		}
+	}
+}
+```
+
+#### 分布式缓存
+
+将指定文件复制到分布式系统，
+
+``job.addCacheFile(new URI("/foo/bar/fileName.txt#fileName.txt"))``
+
+工作机制：当用户启动一个作业，Hadoop会把由-files、-archives和-libjars等选项指定的文件复制到分布式文件系统。在任务运行之前，节点管理器将文件从HDFS复制到本地磁盘，使任务能够访问文件。任务的工作目录和本地缓存建立起符号连接，任务可以本地化访问文件。
+
+节点管理器为缓存中的每个文件各维护一个计数器统计这些文件的被使用情况。当任务即将运行时，该任务所使用的各种文件的对应计数器值加1；当执行完毕，计数器值减1
+
+#### 计数器的作用
+
+包括了任务计数器、作业计数器和用户自定义计数器
+
+**任务计数器**：任务计数器采集任务的相关信息，并把一个作业中所有任务的结果聚集起来
+
+**作业计数器**：由application master维护，记录作业级别的统计量。比如：作业执行中启动map的任务数，或失败的任务数
