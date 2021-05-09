@@ -1,3 +1,15 @@
+---
+layout: post
+title: Go入门语法
+date: 2021-05-09
+Author: yufeng 
+tags: [Golang]
+comments: true
+toc: true
+---
+
+
+
 ## Go入门语法
 
 Go语言是谷歌2009发布的第二款开源编程语言，它意在使人们能够方便的构建简单、可靠、高效的软件。
@@ -331,9 +343,237 @@ type T struct {
 func (t T) M() {
 	fmt.Println(t.S)
 }
-
-// 接口也是值，接口值可以用作函数的参数或返回值。
 ```
 
+#### 接口值
 
+接口也是值，可以像其他值一样传递，接口值可用作函数的参数或返回值，可以看作包含值和具体类型的元组
+
+```go
+type I interface {
+    M()
+}
+
+type T struct {
+    S string
+}
+
+func (t *T) M() {
+    fmt.Println(t.S)
+}
+
+type F float64
+func (f F) M() {
+    fmt.Println(f)
+}
+
+func describe(i I) {
+    fmt.Printf("(%v, %T)\n", i, i)
+}
+func main() {
+    var i I
+    i = &T{"Hello"}
+    describe(i)
+    i.M()
+    
+    i = F(math.Pi)
+    describe(i)
+    i.M()
+}
+
+// 底层值为nil的接口值，即使接口内的具体值为nil，方法仍然会被nil接收者调用
+func main() {
+	var i I
+
+	var t *T
+	i = t
+	describe(i)
+	i.M()
+
+	i = &T{"hello"}
+	describe(i)
+	i.M()
+}
+// nil 接口值既不保存值也不保存具体类型。
+type I interface {
+	M()
+}
+
+type T struct {
+	S string
+}
+func main() {
+	var i I
+	var t &T
+	
+	describe(i)
+	i.M()
+}
+
+// 指定了零个方法的接口值被称为空接口，空接口可保存任何类型的值。可被用来处理未知类型的值
+func main() {
+	var i interface{}
+	describe(i)
+
+	i = 42
+	describe(i)
+
+	i = "hello"
+	describe(i)
+}
+
+func describe(i interface{}) {
+	fmt.Printf("(%v, %T)\n", i, i)
+}
+```
+
+#### 类型断言
+
+类型断言提供了访问接口值底层具体值的方式
+
+``t, ok :=i.(T)``
+
+t为其底层值，ok为true，若不是T类型，ok为false，t为T类型的零值
+
+#### Stringer接口
+
+```go
+type Stringer interface {
+    String() string
+}
+通过此接口来打印值
+```
+
+#### Reader
+
+io包指定了io.Reader接口，从数据流的末尾进行读取
+
+```go
+import (
+	"fmt"
+    "io"
+    "strings"
+)
+
+func main() {
+    r := strings.NewReader("Hello, Reader!")
+    b := make([]byte, 8)
+    for {
+        n, err := r.Read(b)
+        fmt.Printf("n = %v err = %v b = %v\n", n, err, b)
+		fmt.Printf("b[:n] = %q\n", b[:n])
+		if err == io.EOF {
+			break
+		}
+    }
+}
+```
+
+#### Go程
+
+Go程(goroutine)是由Go运行时管理的轻量级线程，当使用go命令时，会启动一个新的Go程并执行
+
+#### 信道
+
+信道是带有类型的管道，你可以通过它用信道操作符 `<-` 来发送或者接收值。
+
+```go
+func sum(s []int, c chan int) {
+    sum := 0
+    for _, v:=range s{
+        sum += v
+    }
+    c <- sum
+}
+
+func main() {
+    s := []int{7,3,2,4,5}
+    c := make(chan int)
+    go sum(s[:len(s)/2], c)
+    go sum(s[len(s)/2:], c)
+    x, y := <-c, <-c
+    fmt.Println(x, y, x+y)
+}
+
+// 带缓冲的信道，仅当信道的缓冲区填满后，向其发送数据时才会阻塞，当缓冲区为空时，接收方会阻塞
+ch := make(chan int, 2)
+
+// range和close
+func main() {
+    c := make(chan int, 10)
+    go fibonacci(cap(c), c)
+    for i:=range c{
+        fmt.Println(i)
+    }
+}
+
+// 使用select使GO程等待多个通信操作。select阻塞到某个分支可以继续执行为止，当多个分支都准备好时，会随机选择一个执行
+import "fmt"
+
+func fibonacci(c, quit chan int) {
+    x, y:= 0, 1
+    for{
+        select {
+            case c <- x:
+            	x, y = y, x+y
+            case <- quit:
+            	fmt.Println("quit")
+            	return
+        }
+    }
+}
+
+func main() {
+    c := make(chan int)
+    quit := make(chan int)
+    go func() {
+        for i:= 0; i < 10; i++ {
+            fmt.Println(<-c)
+        }
+        quit<-0
+    }()
+    fibonacci(c, quit)
+}
+```
+
+#### sync.Mutex
+
+保证每次只有一个Go程能够访问一个共享的变量，使用互斥锁来提供这种机制
+
+在代码前调用Lock，在代码后调用Unlock方法保证一段代码的互斥执行，也可以用defer来保证互斥锁一定会被解锁
+
+```go
+import (
+	"fmt"
+    "sync"
+    "time"
+)
+
+type SateCounter struct {
+    v map[string]int
+    mux sync.MuteX
+}
+
+func (c *SafeCounter) Inc(key string) {
+    c.mux.Lock()
+    c.v[key]++
+    c.mux.Unlock()
+}
+
+func (c *SafeCounter) value(key string) int {
+    c.mux.Lock()
+    defer c.mux.Unlock()
+    return c.v[key]
+}
+
+func main() {
+    c := SafeCounter{v: make(map[string]int)}
+    for i:=0; i < 1000; i++ {
+        go c.Inc("somekey")
+    }
+    
+    time.Sleep(time.Second)
+    fmt.Println(c.Value("somekey"))
+}
+```
 
